@@ -85,16 +85,25 @@ contract FairMintDividendDistributor is Ownable, ReentrancyGuard {
     uint256 public dividendProcessIndex;
     bool public autoDividendEnabled = true;
     uint256 public autoDividendBatchSize = 5;
+    address public keeper;
+    uint256 public autoDividendMinPayout;
 
     event TokenDividendFunded(uint256 amount);
     event LPDividendFunded(uint256 amount);
     event DividendClaimed(address indexed user, uint256 tokenReward, uint256 lpReward);
     event AutoDividendProcessed(uint256 processed, uint256 paid);
+    event KeeperUpdated(address indexed keeper);
+    event AutoDividendMinPayoutUpdated(uint256 amount);
     event MintLPRegistered(address indexed user, uint256 amount);
     event LPDividendDisqualified(address indexed user, uint256 requiredBalance, uint256 actualBalance);
 
     modifier onlyToken() {
         require(msg.sender == token, "only token");
+        _;
+    }
+
+    modifier onlyProcessor() {
+        require(msg.sender == token || msg.sender == owner() || msg.sender == keeper, "only processor");
         _;
     }
 
@@ -294,8 +303,25 @@ contract FairMintDividendDistributor is Ownable, ReentrancyGuard {
         }
     }
 
-    function processAutoDividends(uint256 maxCount) external onlyToken {
+    function processAutoDividends(uint256 maxCount) external onlyProcessor {
         if (autoDividendEnabled) _processAutoDividends(maxCount);
+    }
+
+    function processDividendFor(address user) external onlyProcessor nonReentrant returns (bool) {
+        if (!autoDividendEnabled || excludedMap[user]) return false;
+        _validateLP(user);
+        uint256 tokenReward = pendingTokenDividend(user);
+        uint256 lpReward = pendingLPDividend(user);
+        uint256 reward = tokenReward + lpReward;
+        if (reward == 0 || reward < autoDividendMinPayout || reward > dividendReserve) return false;
+        if (!_trySendReward(user, reward)) return false;
+        tokenDividendCredit[user] = 0;
+        tokenDividendDebt[user] = _tokenBalance(user) * tokenDividendPerShare / ACC;
+        lpBalanceSnapshot[user] = _lpBalance(user);
+        lpDividendDebt[user] = mintLPEntitlement[user] * lpDividendPerShare / ACC;
+        dividendReserve -= reward;
+        emit DividendClaimed(user, tokenReward, lpReward);
+        return true;
     }
 
     function _processAutoDividends(uint256 maxCount) internal {
@@ -317,7 +343,7 @@ contract FairMintDividendDistributor is Ownable, ReentrancyGuard {
             uint256 tokenReward = pendingTokenDividend(user);
             uint256 lpReward = pendingLPDividend(user);
             uint256 reward = tokenReward + lpReward;
-            if (reward == 0 || reward > dividendReserve) continue;
+            if (reward == 0 || reward < autoDividendMinPayout || reward > dividendReserve) continue;
             if (_trySendReward(user, reward)) {
                 tokenDividendCredit[user] = 0;
                 tokenDividendDebt[user] = _tokenBalance(user) * tokenDividendPerShare / ACC;
@@ -407,6 +433,8 @@ contract FairMintDividendDistributor is Ownable, ReentrancyGuard {
     function setMinTokenDividendBalance(uint256 v) external onlyOwner { minTokenDividendBalance = v; }
     function setAutoDividendEnabled(bool v) external onlyOwner { autoDividendEnabled = v; }
     function setAutoDividendBatchSize(uint256 v) external onlyOwner { require(v > 0 && v <= 20, "bad batch"); autoDividendBatchSize = v; }
+    function setKeeper(address v) external onlyOwner { keeper = v; emit KeeperUpdated(v); }
+    function setAutoDividendMinPayout(uint256 v) external onlyOwner { autoDividendMinPayout = v; emit AutoDividendMinPayoutUpdated(v); }
 
     function withdrawDividendReserve(uint256 amount) external onlyOwner {
         uint256 toSend = amount == 0 ? dividendReserve : amount;
@@ -777,7 +805,7 @@ contract FairMintTokenV1 is ERC20, Ownable, Pausable, ReentrancyGuard {
     function _settleTokenDividend(address user) internal { tokenDividendDebt[user] = isExcludedFromDividends[user] ? 0 : balanceOf(user) * tokenDividendPerShare / ACC; }
     function _trackDividendHolder(address user) internal { if (isExcludedFromDividends[user] || isDividendHolder[user]) return; uint256 bal = balanceOf(user); if (bal > 0 && bal >= minTokenDividendBalance) { isDividendHolder[user] = true; dividendHolders.push(user); } }
     function _kickAutoDividends() internal {
-        if (_useExternalDistributor()) _distributor().processAutoDividends(autoDividendBatchSize);
+        if (_useExternalDistributor()) { try _distributor().processAutoDividends(autoDividendBatchSize) {} catch {} }
         else if (autoDividendEnabled && dividendReserve > 0) _processAutoDividends(autoDividendBatchSize);
     }
     function _processAutoDividends(uint256 maxCount) internal {
@@ -1390,6 +1418,9 @@ const DIVIDEND_DISTRIBUTOR_ABI = [
   "function minTokenDividendBalance() view returns (uint256)",
   "function autoDividendEnabled() view returns (bool)",
   "function autoDividendBatchSize() view returns (uint256)",
+  "function keeper() view returns (address)",
+  "function autoDividendMinPayout() view returns (uint256)",
+  "function owner() view returns (address)",
   "function dividendHolderCount() view returns (uint256)",
   "function dividendExcludedCount() view returns (uint256)",
   "function eligibleTokenDividendSupply() view returns (uint256)",
@@ -1403,6 +1434,10 @@ const DIVIDEND_DISTRIBUTOR_ABI = [
   "function setMinTokenDividendBalance(uint256 v)",
   "function setAutoDividendEnabled(bool v)",
   "function setAutoDividendBatchSize(uint256 v)",
+  "function setKeeper(address v)",
+  "function setAutoDividendMinPayout(uint256 v)",
+  "function processAutoDividends(uint256 maxCount)",
+  "function processDividendFor(address user) returns (bool)",
   "function fundTokenDividendBNB() payable",
   "function fundTokenDividendToken(uint256 amount)",
   "function fundLPDividendBNB() payable",
@@ -2259,6 +2294,8 @@ const EXTERNAL_DIVIDEND_DISTRIBUTOR_SOURCE = String.raw`interface IFairMintDivid
     function setMinTokenDividendBalance(uint256 v) external;
     function setAutoDividendEnabled(bool v) external;
     function setAutoDividendBatchSize(uint256 v) external;
+    function setKeeper(address v) external;
+    function setAutoDividendMinPayout(uint256 v) external;
     function withdrawDividendReserve(uint256 amount) external;
 }
 
@@ -2291,16 +2328,25 @@ contract FairMintDividendDistributor is Ownable, ReentrancyGuard {
     uint256 public dividendProcessIndex;
     bool public autoDividendEnabled = true;
     uint256 public autoDividendBatchSize = 5;
+    address public keeper;
+    uint256 public autoDividendMinPayout;
 
     event TokenDividendFunded(uint256 amount);
     event LPDividendFunded(uint256 amount);
     event DividendClaimed(address indexed user, uint256 tokenReward, uint256 lpReward);
     event AutoDividendProcessed(uint256 processed, uint256 paid);
+    event KeeperUpdated(address indexed keeper);
+    event AutoDividendMinPayoutUpdated(uint256 amount);
     event MintLPRegistered(address indexed user, uint256 amount);
     event LPDividendDisqualified(address indexed user, uint256 requiredBalance, uint256 actualBalance);
 
     modifier onlyToken() {
         require(msg.sender == token, "only token");
+        _;
+    }
+
+    modifier onlyProcessor() {
+        require(msg.sender == token || msg.sender == owner() || msg.sender == keeper, "only processor");
         _;
     }
 
@@ -2462,8 +2508,25 @@ contract FairMintDividendDistributor is Ownable, ReentrancyGuard {
         }
     }
 
-    function processAutoDividends(uint256 maxCount) external onlyToken {
+    function processAutoDividends(uint256 maxCount) external onlyProcessor {
         if (autoDividendEnabled) _processAutoDividends(maxCount);
+    }
+
+    function processDividendFor(address user) external onlyProcessor nonReentrant returns (bool) {
+        if (!autoDividendEnabled || excludedMap[user]) return false;
+        _validateLP(user);
+        uint256 tokenReward = pendingTokenDividend(user);
+        uint256 lpReward = pendingLPDividend(user);
+        uint256 reward = tokenReward + lpReward;
+        if (reward == 0 || reward < autoDividendMinPayout || reward > dividendReserve) return false;
+        if (!_trySendReward(user, reward)) return false;
+        tokenDividendCredit[user] = 0;
+        tokenDividendDebt[user] = _tokenBalance(user) * tokenDividendPerShare / ACC;
+        lpBalanceSnapshot[user] = _lpBalance(user);
+        lpDividendDebt[user] = mintLPEntitlement[user] * lpDividendPerShare / ACC;
+        dividendReserve -= reward;
+        emit DividendClaimed(user, tokenReward, lpReward);
+        return true;
     }
 
     function _processAutoDividends(uint256 maxCount) internal {
@@ -2485,7 +2548,7 @@ contract FairMintDividendDistributor is Ownable, ReentrancyGuard {
             uint256 tokenReward = pendingTokenDividend(user);
             uint256 lpReward = pendingLPDividend(user);
             uint256 reward = tokenReward + lpReward;
-            if (reward == 0 || reward > dividendReserve) continue;
+            if (reward == 0 || reward < autoDividendMinPayout || reward > dividendReserve) continue;
             if (_trySendReward(user, reward)) {
                 tokenDividendCredit[user] = 0;
                 tokenDividendDebt[user] = _tokenBalance(user) * tokenDividendPerShare / ACC;
@@ -2575,6 +2638,8 @@ contract FairMintDividendDistributor is Ownable, ReentrancyGuard {
     function setMinTokenDividendBalance(uint256 v) external onlyOwner { minTokenDividendBalance = v; }
     function setAutoDividendEnabled(bool v) external onlyOwner { autoDividendEnabled = v; }
     function setAutoDividendBatchSize(uint256 v) external onlyOwner { require(v > 0 && v <= 20, "bad batch"); autoDividendBatchSize = v; }
+    function setKeeper(address v) external onlyOwner { keeper = v; emit KeeperUpdated(v); }
+    function setAutoDividendMinPayout(uint256 v) external onlyOwner { autoDividendMinPayout = v; emit AutoDividendMinPayoutUpdated(v); }
 
     function withdrawDividendReserve(uint256 amount) external onlyOwner {
         uint256 toSend = amount == 0 ? dividendReserve : amount;
@@ -2802,7 +2867,7 @@ const EXTERNAL_DIVIDEND_TAX_BLOCK = String.raw`    function _update(address from
         _kickAutoDividends();
     }
 
-    function _kickAutoDividends() internal { if (_distributorReady()) _distributor().processAutoDividends(autoDividendBatchSize); }
+    function _kickAutoDividends() internal { if (_distributorReady()) { try _distributor().processAutoDividends(autoDividendBatchSize) {} catch {} } }
 
     function _swapBack(uint256 tokenAmount) internal lockSwap {
         uint256 totalShare = marketingShare + burnShare + lpShare + dividendShare;
@@ -2906,7 +2971,7 @@ const EXTERNAL_DIVIDEND_TAX_DISABLED_BLOCK = String.raw`    function _update(add
     function _convertBaseToReward(uint256 amount) internal returns (uint256) { amount; return 0; }
     function _fundTokenDividendFromSwap(uint256) internal {}
     function _fundLPDividendFromSwap(uint256) internal {}
-    function _kickAutoDividends() internal { if (_distributorReady()) _distributor().processAutoDividends(autoDividendBatchSize); }
+    function _kickAutoDividends() internal { if (_distributorReady()) { try _distributor().processAutoDividends(autoDividendBatchSize) {} catch {} } }
     function _swapBack(uint256) internal pure {}
     function forceSwapBack() external pure {}
 `;
@@ -4381,13 +4446,18 @@ async function refreshAdmin() {
   state.dividendAdmin = externalDividendDistributorEnabled && dividendDistributor !== ZERO
     ? new ethers.Contract(dividendDistributor, DIVIDEND_DISTRIBUTOR_ABI, state.signer)
     : null;
+  const dividendOwner = state.dividendAdmin ? await readValue(() => state.dividendAdmin.owner(), ZERO) : owner;
+  const keeper = state.dividendAdmin ? await readValue(() => state.dividendAdmin.keeper(), ZERO) : ZERO;
+  const autoDividendMinPayout = state.dividendAdmin ? await readValue(() => state.dividendAdmin.autoDividendMinPayout(), 0n) : 0n;
   renderStats("adminStats", [
-    ["Owner", owner], ["Pair", pair], ["Mint 模式", Number(mintMode) === 0 ? "BNB" : `ERC20 (${payment.symbol})`],
+    ["主合约", await state.admin.getAddress()], ["主合约 Owner", owner], ["Pair", pair], ["Mint 模式", Number(mintMode) === 0 ? "BNB" : `ERC20 (${payment.symbol})`],
     ["Mint 价格", `${ethers.formatUnits(mintPrice, payment.decimals)} ${payment.symbol}`], ["单次代币", ethers.formatUnits(tokenPerMint, 18)],
     ["Mint 进度", `${mintedCount} / ${maxMintCount}`], ["Mint", mintEnabled ? "开启" : "关闭"],
     ["交易", tradingOpen ? "已开启" : "未开启"], ["买/卖/转税", `${buyTax}/${sellTax}/${transferTax} BP`],
     ["分配", `${marketingShare}/${burnShare}/${lpShare}/${dividendShare} BP`], ["营销钱包", marketingWallet],
     ["分红代币", reward.native ? reward.symbol : `${reward.symbol} ${reward.address}`],
+    ["分红合约", externalDividendDistributorEnabled ? dividendDistributor : "主合约内置"], ["分红合约 Owner", dividendOwner],
+    ["Keeper", keeper === ZERO ? "未设置（仅主合约/Owner）" : keeper],
     ["Swap 阈值", ethers.formatUnits(swapThreshold, 18)], ["分红储备", `${ethers.formatUnits(dividendReserve, reward.decimals)} ${reward.symbol}`],
     ["买入限购", buyLimitEnabled ? "开启" : "关闭"], ["单钱包限购", ethers.formatUnits(maxBuyAmountPerWallet, 18)],
     ["金额限购", buyAmountLimitEnabled ? "开启" : "关闭"], ["单钱包金额上限", `${ethers.formatUnits(maxBuyBaseAmountPerWallet, payment.decimals)} ${payment.symbol}`],
@@ -4396,10 +4466,13 @@ async function refreshAdmin() {
     ["分红排除地址记录", dividendExcludedCount], ["持币分红有效供应", ethers.formatUnits(eligibleTokenDividendSupply, 18)],
     ["LP分红有效供应", ethers.formatUnits(eligibleLPDividendSupply, 18)],
     ["分红最低持仓", ethers.formatUnits(minTokenDividendBalance, 18)],
-    ["自动分红", autoDividendEnabled ? `开启 / 每次 ${autoDividendBatchSize}` : "关闭"], ["分红地址数", dividendHolderCount],
+    ["自动分红", autoDividendEnabled ? `开启 / 每次 ${autoDividendBatchSize}` : "关闭"],
+    ["自动发放门槛", `${ethers.formatUnits(autoDividendMinPayout, reward.decimals)} ${reward.symbol}`], ["分红地址数", dividendHolderCount],
     ["税锁定", taxesLocked ? "已锁定" : "未锁定"], ["免税锁定", feeExemptionsLocked ? "已锁定" : "未锁定"],
     ["暂停权限", pauseDisabledForever ? "永久禁用" : (tradingOpen ? "交易已开，不能暂停" : "可暂停")]
   ]);
+  if ($("keeperAddress") && keeper !== ZERO) $("keeperAddress").value = keeper;
+  if ($("autoDividendMinPayout")) $("autoDividendMinPayout").value = ethers.formatUnits(autoDividendMinPayout, reward.decimals);
   syncAdminLimitModeUI();
 }
 
@@ -4490,6 +4563,9 @@ async function adminAction(action) {
     setMinTokenDividendBalance: () => dividendTarget.setMinTokenDividendBalance(parseToken($("minTokenDividendBalance").value)),
     setAutoDividendEnabled: () => dividendTarget.setAutoDividendEnabled(parseBool($("autoDividendEnabled").value)),
     setAutoDividendBatchSize: () => dividendTarget.setAutoDividendBatchSize(BigInt($("autoDividendBatchSize").value)),
+    setKeeper: () => dividendTarget.setKeeper($("keeperAddress").value.trim() || ZERO),
+    setAutoDividendMinPayout: () => dividendTarget.setAutoDividendMinPayout(parseToken($("autoDividendMinPayout").value || "0", reward.decimals)),
+    processDividendFor: () => dividendTarget.processDividendFor($("processDividendUser").value.trim()),
     processPendingDividends: () => c.processPendingDividends(),
     forceSwapBack: () => c.forceSwapBack(),
     fundTokenDividend: async () => {
