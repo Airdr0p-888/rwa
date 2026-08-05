@@ -56,6 +56,16 @@ interface IFairMintDividendDistributor {
     function notifyLPDividendToken(uint256 amount) external;
 }
 
+contract FairMintSwapReceiver {
+    using SafeERC20 for IERC20;
+    address public immutable token;
+    constructor(address token_) { token = token_; }
+    function release(address asset, address to, uint256 amount) external {
+        require(msg.sender == token, "only token");
+        IERC20(asset).safeTransfer(to, amount);
+    }
+}
+
 contract FairMintDividendDistributor is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -458,6 +468,7 @@ contract FairMintTokenV1 is ERC20, Ownable, Pausable, ReentrancyGuard {
     LaunchMode public launchMode;
     address public usdtAddress;
     IPancakeRouterV2 public router;
+    FairMintSwapReceiver public immutable swapReceiver;
     address public pair;
     uint256 public mintPrice;
     uint256 public tokenPerMint;
@@ -561,6 +572,7 @@ contract FairMintTokenV1 is ERC20, Ownable, Pausable, ReentrancyGuard {
         mintMode = mintMode_;
         usdtAddress = usdtAddress_;
         router = IPancakeRouterV2(router_);
+        swapReceiver = new FairMintSwapReceiver(address(this));
         mintPrice = mintPrice_;
         tokenPerMint = tokenPerMint_;
         maxMintCount = maxMintCount_;
@@ -713,10 +725,11 @@ contract FairMintTokenV1 is ERC20, Ownable, Pausable, ReentrancyGuard {
         uint256 tokensToSwap = marketingTokens + dividendTokens + lpTokenHalf;
         uint256 received;
         if (tokensToSwap > 0) {
-            uint256 beforeBal = _baseBalance(); _approve(address(this), address(router), tokensToSwap);
+            uint256 beforeBal = mintMode == MintMode.BNB ? _baseBalance() : IERC20(usdtAddress).balanceOf(address(swapReceiver)); _approve(address(this), address(router), tokensToSwap);
             if (mintMode == MintMode.BNB) { address[] memory path = new address[](2); path[0] = address(this); path[1] = router.WETH(); router.swapExactTokensForETHSupportingFeeOnTransferTokens(tokensToSwap, 0, path, address(this), block.timestamp); }
-            else { address[] memory path = new address[](2); path[0] = address(this); path[1] = usdtAddress; router.swapExactTokensForTokensSupportingFeeOnTransferTokens(tokensToSwap, 0, path, address(this), block.timestamp); }
-            received = _baseBalance() - beforeBal;
+            else { address[] memory path = new address[](2); path[0] = address(this); path[1] = usdtAddress; router.swapExactTokensForTokensSupportingFeeOnTransferTokens(tokensToSwap, 0, path, address(swapReceiver), block.timestamp); }
+            if (mintMode == MintMode.BNB) received = _baseBalance() - beforeBal;
+            else { received = IERC20(usdtAddress).balanceOf(address(swapReceiver)) - beforeBal; swapReceiver.release(usdtAddress, address(this), received); }
         }
         if (received > 0) {
             uint256 marketingAmt = received * marketingTokens / tokensToSwap;
@@ -976,6 +989,16 @@ interface IPancakePairV2Lite {
     function token0() external view returns (address);
 }
 
+contract FairMintSwapReceiver {
+    using SafeERC20 for IERC20;
+    address public immutable token;
+    constructor(address token_) { token = token_; }
+    function release(address asset, address to, uint256 amount) external {
+        require(msg.sender == token, "only token");
+        IERC20(asset).safeTransfer(to, amount);
+    }
+}
+
 contract FairMintTokenV1 is ERC20, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -991,6 +1014,7 @@ contract FairMintTokenV1 is ERC20, Ownable, Pausable, ReentrancyGuard {
     LaunchMode public launchMode;
     address public usdtAddress;
     IPancakeRouterV2Lite public router;
+    FairMintSwapReceiver public immutable swapReceiver;
     address public pair;
     uint256 public mintPrice;
     uint256 public tokenPerMint;
@@ -1112,6 +1136,7 @@ contract FairMintTokenV1 is ERC20, Ownable, Pausable, ReentrancyGuard {
         mintMode = mintMode_;
         usdtAddress = usdtAddress_;
         router = IPancakeRouterV2Lite(router_);
+        swapReceiver = new FairMintSwapReceiver(address(this));
         mintPrice = mintPrice_;
         tokenPerMint = tokenPerMint_;
         maxMintCount = maxMintCount_;
@@ -1301,7 +1326,7 @@ contract FairMintTokenV1 is ERC20, Ownable, Pausable, ReentrancyGuard {
         uint256 tokensToSwap = marketingTokens + dividendTokens + lpTokenHalf;
         uint256 received;
         if (tokensToSwap > 0) {
-            uint256 beforeBal = _baseBalance();
+            uint256 beforeBal = mintMode == MintMode.BNB ? _baseBalance() : IERC20(usdtAddress).balanceOf(address(swapReceiver));
             _approve(address(this), address(router), tokensToSwap);
             if (mintMode == MintMode.BNB) {
                 address[] memory path = new address[](2);
@@ -1312,9 +1337,13 @@ contract FairMintTokenV1 is ERC20, Ownable, Pausable, ReentrancyGuard {
                 address[] memory path = new address[](2);
                 path[0] = address(this);
                 path[1] = usdtAddress;
-                router.swapExactTokensForTokensSupportingFeeOnTransferTokens(tokensToSwap, 0, path, address(this), block.timestamp);
+                router.swapExactTokensForTokensSupportingFeeOnTransferTokens(tokensToSwap, 0, path, address(swapReceiver), block.timestamp);
             }
-            received = _baseBalance() - beforeBal;
+            if (mintMode == MintMode.BNB) received = _baseBalance() - beforeBal;
+            else {
+                received = IERC20(usdtAddress).balanceOf(address(swapReceiver)) - beforeBal;
+                swapReceiver.release(usdtAddress, address(this), received);
+            }
         }
         if (received > 0) {
             uint256 marketingAmt = received * marketingTokens / tokensToSwap;
@@ -1489,6 +1518,7 @@ const ADMIN_TOKEN_ABI = [
   "function feeExemptionsLocked() view returns (bool)",
   "function pauseDisabledForever() view returns (bool)",
   "function externalDividendDistributorEnabled() view returns (bool)",
+  "function swapEnabled() view returns (bool)",
   "function dividendDistributor() view returns (address)",
   "function rewardTokenAddress() view returns (address)",
   "function usdtAddress() view returns (address)",
@@ -1522,6 +1552,7 @@ const ADMIN_TOKEN_ABI = [
   "function setMarketingWallet(address)",
   "function setDividendTargetMode(uint256)",
   "function setSwapThreshold(uint256)",
+  "function setSwapEnabled(bool)",
   "function setBuyLimitEnabled(bool)",
   "function setMaxBuyAmountPerWallet(uint256)",
   "function setBuyAmountLimitEnabled(bool)",
@@ -2186,7 +2217,7 @@ const LITE_TAX_BLOCK = String.raw`    function _update(address from, address to,
         uint256 tokensToSwap = marketingTokens + dividendTokens + lpTokenHalf;
         uint256 received;
         if (tokensToSwap > 0) {
-            uint256 beforeBal = _baseBalance();
+            uint256 beforeBal = mintMode == MintMode.BNB ? _baseBalance() : IERC20(usdtAddress).balanceOf(address(swapReceiver));
             _approve(address(this), address(router), tokensToSwap);
             if (mintMode == MintMode.BNB) {
                 address[] memory path = new address[](2);
@@ -2197,9 +2228,13 @@ const LITE_TAX_BLOCK = String.raw`    function _update(address from, address to,
                 address[] memory path = new address[](2);
                 path[0] = address(this);
                 path[1] = usdtAddress;
-                router.swapExactTokensForTokensSupportingFeeOnTransferTokens(tokensToSwap, 0, path, address(this), block.timestamp);
+                router.swapExactTokensForTokensSupportingFeeOnTransferTokens(tokensToSwap, 0, path, address(swapReceiver), block.timestamp);
             }
-            received = _baseBalance() - beforeBal;
+            if (mintMode == MintMode.BNB) received = _baseBalance() - beforeBal;
+            else {
+                received = IERC20(usdtAddress).balanceOf(address(swapReceiver)) - beforeBal;
+                swapReceiver.release(usdtAddress, address(this), received);
+            }
         }
         if (received > 0) {
             uint256 marketingAmt = received * marketingTokens / tokensToSwap;
@@ -2884,7 +2919,7 @@ const EXTERNAL_DIVIDEND_TAX_BLOCK = String.raw`    function _update(address from
         uint256 tokensToSwap = marketingTokens + dividendTokens + lpTokenHalf;
         uint256 received;
         if (tokensToSwap > 0) {
-            uint256 beforeBal = _baseBalance();
+            uint256 beforeBal = mintMode == MintMode.BNB ? _baseBalance() : IERC20(usdtAddress).balanceOf(address(swapReceiver));
             _approve(address(this), address(router), tokensToSwap);
             if (mintMode == MintMode.BNB) {
                 address[] memory path = new address[](2);
@@ -2895,9 +2930,13 @@ const EXTERNAL_DIVIDEND_TAX_BLOCK = String.raw`    function _update(address from
                 address[] memory path = new address[](2);
                 path[0] = address(this);
                 path[1] = usdtAddress;
-                router.swapExactTokensForTokensSupportingFeeOnTransferTokens(tokensToSwap, 0, path, address(this), block.timestamp);
+                router.swapExactTokensForTokensSupportingFeeOnTransferTokens(tokensToSwap, 0, path, address(swapReceiver), block.timestamp);
             }
-            received = _baseBalance() - beforeBal;
+            if (mintMode == MintMode.BNB) received = _baseBalance() - beforeBal;
+            else {
+                received = IERC20(usdtAddress).balanceOf(address(swapReceiver)) - beforeBal;
+                swapReceiver.release(usdtAddress, address(this), received);
+            }
         }
         if (received > 0) {
             uint256 marketingAmt = received * marketingTokens / tokensToSwap;
@@ -4428,7 +4467,7 @@ async function refreshAdmin() {
     buyWhitelistEnabled,
     preLaunchBuyWhitelistEnabled,
     dividendExcludedCount, eligibleTokenDividendSupply, eligibleLPDividendSupply,
-    taxesLocked, feeExemptionsLocked, pauseDisabledForever, externalDividendDistributorEnabled, dividendDistributor
+    taxesLocked, feeExemptionsLocked, pauseDisabledForever, externalDividendDistributorEnabled, dividendDistributor, swapEnabled
   ] = await Promise.all([
     readValue(() => state.admin.owner(), ZERO), readValue(() => state.admin.pair(), ZERO), readValue(() => state.admin.mintMode(), 0), readValue(() => state.admin.mintPrice(), 0n), readValue(() => state.admin.tokenPerMint(), 0n),
     readValue(() => state.admin.mintedCount(), 0n), readValue(() => state.admin.maxMintCount(), 0n), readValue(() => state.admin.mintEnabled(), false), readValue(() => state.admin.tradingOpen(), false),
@@ -4441,7 +4480,7 @@ async function refreshAdmin() {
     readValue(() => state.admin.preLaunchBuyWhitelistEnabled(), false),
     readValue(() => state.admin.dividendExcludedCount(), 0n), readValue(() => state.admin.eligibleTokenDividendSupply(), 0n), readValue(() => state.admin.eligibleLPDividendSupply(), 0n),
     readValue(() => state.admin.taxesLocked(), false), readValue(() => state.admin.feeExemptionsLocked(), false), readValue(() => state.admin.pauseDisabledForever(), false),
-    readValue(() => state.admin.externalDividendDistributorEnabled(), false), readValue(() => state.admin.dividendDistributor(), ZERO)
+    readValue(() => state.admin.externalDividendDistributorEnabled(), false), readValue(() => state.admin.dividendDistributor(), ZERO), readValue(() => state.admin.swapEnabled(), false)
   ]);
   state.dividendAdmin = externalDividendDistributorEnabled && dividendDistributor !== ZERO
     ? new ethers.Contract(dividendDistributor, DIVIDEND_DISTRIBUTOR_ABI, state.signer)
@@ -4458,7 +4497,7 @@ async function refreshAdmin() {
     ["分红代币", reward.native ? reward.symbol : `${reward.symbol} ${reward.address}`],
     ["分红合约", externalDividendDistributorEnabled ? dividendDistributor : "主合约内置"], ["分红合约 Owner", dividendOwner],
     ["Keeper", keeper === ZERO ? "未设置（仅主合约/Owner）" : keeper],
-    ["Swap 阈值", ethers.formatUnits(swapThreshold, 18)], ["分红储备", `${ethers.formatUnits(dividendReserve, reward.decimals)} ${reward.symbol}`],
+    ["SwapBack", swapEnabled ? "开启" : "关闭"], ["Swap 阈值", ethers.formatUnits(swapThreshold, 18)], ["分红储备", `${ethers.formatUnits(dividendReserve, reward.decimals)} ${reward.symbol}`],
     ["买入限购", buyLimitEnabled ? "开启" : "关闭"], ["单钱包限购", ethers.formatUnits(maxBuyAmountPerWallet, 18)],
     ["金额限购", buyAmountLimitEnabled ? "开启" : "关闭"], ["单钱包金额上限", `${ethers.formatUnits(maxBuyBaseAmountPerWallet, payment.decimals)} ${payment.symbol}`],
     ["买入白名单", buyWhitelistEnabled ? "开启" : "关闭"],
@@ -4472,6 +4511,7 @@ async function refreshAdmin() {
     ["暂停权限", pauseDisabledForever ? "永久禁用" : (tradingOpen ? "交易已开，不能暂停" : "可暂停")]
   ]);
   if ($("keeperAddress") && keeper !== ZERO) $("keeperAddress").value = keeper;
+  if ($("swapEnabled")) $("swapEnabled").value = String(swapEnabled);
   if ($("autoDividendMinPayout")) $("autoDividendMinPayout").value = ethers.formatUnits(autoDividendMinPayout, reward.decimals);
   syncAdminLimitModeUI();
 }
@@ -4552,6 +4592,7 @@ async function adminAction(action) {
     setDividendTargetMode: () => c.setDividendTargetMode(BigInt($("dividendTargetMode").value)),
     setRewardToken: () => dividendTarget.setRewardToken($("rewardTokenAdmin").value.trim() || ZERO),
     setSwapThreshold: () => c.setSwapThreshold(parseToken($("swapThreshold").value)),
+    setSwapEnabled: () => c.setSwapEnabled(parseBool($("swapEnabled").value)),
     setBuyLimitEnabled: () => c.setBuyLimitEnabled(parseBool($("buyLimitEnabled").value)),
     setMaxBuyAmountPerWallet: () => c.setMaxBuyAmountPerWallet(parseToken($("maxBuyAmountPerWallet").value)),
     setBuyAmountLimitEnabled: () => c.setBuyAmountLimitEnabled(parseBool($("buyAmountLimitEnabled").value)),
